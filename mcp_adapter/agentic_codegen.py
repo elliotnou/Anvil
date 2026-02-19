@@ -1,0 +1,671 @@
+"""Anvil code forge — purely LLM-driven MCP server generation.
+
+The entire server.py is written by DeepSeek-V3 via the Featherless API
+in a single pass. No scaffolding, no stitching — pure generation.
+Validated with ast.parse() and auto-repaired if needed.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import os
+import re
+import textwrap
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from .logger import get_logger, log_stage
+from .models import (
+    APISpec,
+    AuthScheme,
+    HttpMethod,
+    ParamLocation,
+    SafetyLevel,
+    ToolDefinition,
+    ToolParam,
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LLM provider — Anthropic (Claude) or any OpenAI-compatible API
+# ═══════════════════════════════════════════════════════════════════════════
+
+_DEFAULT_BASE_URL = "https://api.featherless.ai/v1"
+_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3-0324"
+_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _call_anthropic(prompt: str, *, system_instruction: str | None = None,
+                    temperature: float = 0.15, max_tokens: int = 16384) -> str:
+    """Call Claude via the Anthropic Messages API."""
+    logger = get_logger()
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    model = os.getenv("LLM_MODEL", _ANTHROPIC_MODEL)
+    logger.info("  LLM → Anthropic (%s)", model)
+
+    body: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system_instruction:
+        body["system"] = system_instruction
+
+    with httpx.Client(timeout=180.0) as c:
+        resp = c.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+        resp.raise_for_status()
+    return resp.json()["content"][0]["text"]
+
+
+def _call_openai_compat(prompt: str, *, system_instruction: str | None = None,
+                        temperature: float = 0.15, max_tokens: int = 16384) -> str:
+    """Call any OpenAI-compatible API (DeepSeek, Featherless, Ollama, etc.)."""
+    logger = get_logger()
+    api_key = (os.getenv("LLM_API_KEY")
+               or os.getenv("FEATHERLESS_API_KEY", ""))
+    base_url = (os.getenv("LLM_BASE_URL")
+                or os.getenv("FEATHERLESS_BASE_URL", _DEFAULT_BASE_URL))
+    model = (os.getenv("LLM_MODEL")
+             or os.getenv("FEATHERLESS_MODEL", _DEFAULT_MODEL))
+    logger.info("  LLM → %s (%s)", base_url, model)
+
+    messages: list[dict[str, str]] = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction})
+    messages.append({"role": "user", "content": prompt})
+
+    with httpx.Client(timeout=180.0) as c:
+        resp = c.post(
+            f"{base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            },
+        )
+        resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def _call_llm(prompt: str, *, system_instruction: str | None = None,
+              temperature: float = 0.15, max_tokens: int = 16384) -> str:
+    """Route to the right LLM provider based on env vars.
+
+    Priority:
+        1. ANTHROPIC_API_KEY → Claude (Haiku 4.5 by default, ~$0.01/generation)
+        2. LLM_API_KEY       → any OpenAI-compatible provider
+        3. FEATHERLESS_API_KEY → Featherless (legacy default)
+    """
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return _call_anthropic(prompt, system_instruction=system_instruction,
+                               temperature=temperature, max_tokens=max_tokens)
+
+    api_key = os.getenv("LLM_API_KEY") or os.getenv("FEATHERLESS_API_KEY", "")
+    if not api_key:
+        raise RuntimeError(
+            "No LLM API key found. Set one of these in your .env:\n"
+            "  ANTHROPIC_API_KEY=your-key     (Claude — recommended)\n"
+            "  LLM_API_KEY=your-key           (any OpenAI-compatible provider)\n"
+            "  FEATHERLESS_API_KEY=your-key    (Featherless)\n\n"
+            "Or use --no-llm for template-based generation (no key needed)."
+        )
+
+    return _call_openai_compat(prompt, system_instruction=system_instruction,
+                               temperature=temperature, max_tokens=max_tokens)
+
+
+def _extract_code(text: str) -> str:
+    """Pull the first ```python ... ``` block (or the whole text)."""
+    m = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"```\w*\s*\n(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# System prompt — tells the LLM exactly how to generate a complete server
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SYSTEM_PROMPT = textwrap.dedent("""\
+    You are an expert Python developer. You generate complete, production-ready
+    MCP server files using the `dedalus_mcp` framework.
+
+    ## Rules
+
+    1. Output ONLY Python code inside a single ```python fence. No prose.
+    2. The file must be a complete, runnable Python module.
+    3. Use these imports:
+       ```
+       from __future__ import annotations
+       import asyncio, json, os
+       from typing import Any
+       import httpx
+       from dedalus_mcp import MCPServer, tool
+       ```
+    4. Configuration via environment variables:
+       - `<PREFIX>_BASE_URL` — base URL of the upstream API
+       - `<PREFIX>_API_KEY`  — API key (may be empty)
+    5. Define a `_headers()` helper that returns auth headers.
+       - For Bearer auth: `{"Authorization": f"Bearer {API_KEY}"}`
+       - For apiKey auth: use the correct header name with the raw key value
+       - Always include `Content-Type` and `Accept` as `application/json`
+    6. Define an `async def _request(method, path, *, params=None, body=None) -> str`
+       helper that:
+       - Builds the full URL from BASE_URL + path
+       - Uses `httpx.AsyncClient` with `timeout=30.0`
+       - Returns `json.dumps(resp.json(), indent=2)` on success
+       - Returns `json.dumps({"error": ..., "status": ...})` on HTTP errors
+       - Returns `json.dumps({"error": ...})` on other exceptions
+    7. Each tool is an `async def` decorated with `@tool(description="...")`.
+       - Returns `str`.
+       - Calls `await _request(...)`.
+       - Required params first, optional params have `| None = None`.
+       - Path params via f-strings: `f"/pets/{pet_id}"`.
+       - Query params: build a `params` dict, skip None values.
+       - Body params (POST/PUT/PATCH): build a `body` dict, skip None values.
+       - DELETE: just call `_request("DELETE", path)`.
+       - One-line docstring.
+       - Safety badges in description: write → "[WRITES DATA]", destructive → "[DESTRUCTIVE]".
+    8. At the bottom:
+       ```
+       server = MCPServer("<name>")
+       server.collect(<all tool function references>)
+       if __name__ == "__main__":
+           asyncio.run(server.serve())
+       ```
+    9. Type mapping: string→str, integer→int, number→float, boolean→bool,
+       array→list, object→dict
+
+    ## Example complete server
+
+    ```python
+    from __future__ import annotations
+    import asyncio, json, os
+    from typing import Any
+    import httpx
+    from dedalus_mcp import MCPServer, tool
+
+    BASE_URL = os.getenv("PETSTORE_API_BASE_URL", "https://petstore.example.com/api/v1")
+    API_KEY  = os.getenv("PETSTORE_API_API_KEY", "")
+
+    def _headers() -> dict[str, str]:
+        h = {"Content-Type": "application/json", "Accept": "application/json"}
+        if API_KEY:
+            h["X-API-Key"] = API_KEY
+        return h
+
+    async def _request(method: str, path: str, *, params: dict[str, Any] | None = None,
+                       body: dict[str, Any] | None = None) -> str:
+        url = f"{BASE_URL}{path}"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                resp = await client.request(method, url, headers=_headers(),
+                                            params=params, json=body if body else None)
+                resp.raise_for_status()
+                try:
+                    return json.dumps(resp.json(), indent=2)
+                except Exception:
+                    return resp.text
+            except httpx.HTTPStatusError as e:
+                return json.dumps({"error": str(e), "status": e.response.status_code})
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
+    @tool(description="Search or list pets")
+    async def search_pets(species: str | None = None, limit: int = 20) -> str:
+        \"\"\"Search or list pets.\"\"\"
+        params: dict[str, Any] = {}
+        if species is not None:
+            params["species"] = species
+        params["limit"] = limit
+        return await _request("GET", "/pets", params=params)
+
+    @tool(description="Create a pet [WRITES DATA]")
+    async def create_pet(name: str, species: str) -> str:
+        \"\"\"Add a new pet.\"\"\"
+        return await _request("POST", "/pets", body={"name": name, "species": species})
+
+    @tool(description="Delete a pet [DESTRUCTIVE]")
+    async def delete_pet(pet_id: int) -> str:
+        \"\"\"Permanently remove a pet.\"\"\"
+        return await _request("DELETE", f"/pets/{pet_id}")
+
+    server = MCPServer("petstore")
+    server.collect(search_pets, create_pet, delete_pet)
+    if __name__ == "__main__":
+        asyncio.run(server.serve())
+    ```
+""")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Prompt builders
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _describe_tool(t: ToolDefinition) -> str:
+    """Compact text description of one tool for the LLM prompt."""
+    lines = [f"### Tool: `{t.name}`"]
+    lines.append(f"- Description: {t.description}")
+    lines.append(f"- Safety: {t.safety.value}")
+    for ep in t.endpoints:
+        lines.append(f"- Endpoint: {ep.method.value} {ep.path}")
+    if t.params:
+        lines.append("- Parameters:")
+        for p in t.params:
+            loc = "body"
+            for ep in t.endpoints:
+                for ep_p in ep.parameters:
+                    if ep_p.name == p.name:
+                        loc = ep_p.location.value
+                        break
+            lines.append(
+                f"  - `{p.name}`: {p.json_type}, "
+                f"{'required' if p.required else 'optional'}, "
+                f"location={loc}"
+                + (f", description: {p.description}" if p.description else "")
+            )
+    return "\n".join(lines)
+
+
+def _describe_auth(schemes: list[AuthScheme]) -> str:
+    """Describe auth schemes for the prompt."""
+    if not schemes:
+        return "No authentication required (but still support optional API_KEY with Bearer token)."
+    parts = []
+    for s in schemes:
+        if s.scheme_type == "apiKey":
+            hdr = s.header_name or s.name or "X-API-Key"
+            parts.append(f"apiKey via header `{hdr}` (use raw API_KEY value, no Bearer prefix)")
+        elif s.scheme_type in ("http", "oauth2"):
+            parts.append(f"Bearer token via `Authorization: Bearer {{API_KEY}}`")
+        else:
+            parts.append(f"{s.scheme_type}: {s.name}")
+    return "; ".join(parts)
+
+
+def _build_server_prompt(
+    spec: APISpec,
+    tools: list[ToolDefinition],
+    server_name: str,
+    env_prefix: str,
+) -> str:
+    """Build the full prompt for generating server.py."""
+    tool_specs = "\n\n".join(_describe_tool(t) for t in tools)
+    auth_desc = _describe_auth(spec.auth_schemes)
+
+    return textwrap.dedent(f"""\
+        Generate a complete MCP server Python file for the following API.
+
+        ## API Info
+        - Title: {spec.title}
+        - Version: {spec.version}
+        - Base URL: {spec.base_url}
+        - Description: {spec.description or "N/A"}
+        - Auth: {auth_desc}
+
+        ## Environment variable prefix: `{env_prefix}`
+        - `{env_prefix}_BASE_URL` (default: `{spec.base_url}`)
+        - `{env_prefix}_API_KEY` (default: `""`)
+
+        ## Server name: `{server_name}`
+
+        ## Tools ({len(tools)} total)
+
+        {tool_specs}
+
+        Generate the COMPLETE server.py file with ALL {len(tools)} tools.
+        Return ONLY the Python code inside a ```python fence.
+    """)
+
+
+def _build_test_prompt(spec: APISpec, tools: list[ToolDefinition]) -> str:
+    """Build the prompt for generating test_server.py."""
+    tool_names = [t.name for t in tools]
+    tool_test_list = "\n".join(
+        f"   - test_{t.name}() — call tool \"{t.name}\" with sample args and verify it returns a string"
+        for t in tools
+    )
+    return textwrap.dedent(f"""\
+        Generate a COMPLETE test file for an MCP server with ALL {len(tools)} tools.
+
+        API: {spec.title} v{spec.version}
+        Tools ({len(tools)}): {tool_names}
+        Server URL: http://127.0.0.1:8000/mcp
+
+        Use `dedalus_mcp.client.MCPClient`:
+        ```python
+        client = await MCPClient.connect("http://127.0.0.1:8000/mcp")
+        tools = await client.list_tools()
+        result = await client.call_tool("name", {{"key": "val"}})
+        await client.close()
+        ```
+
+        You MUST include ALL of these test functions:
+        1. test_list_tools() — verify exactly {len(tools)} tools registered
+        2. test_tool_schemas() — each tool has name + description
+{tool_test_list}
+        3. main() that runs ALL tests
+        4. if __name__ == "__main__" block
+
+        IMPORTANT: Generate a test function for EVERY tool listed above.
+        Do NOT skip any. Total expected: {2 + len(tools)} test functions.
+
+        Return ONLY ```python code.
+    """)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Validation & repair
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _validate_python(code: str) -> tuple[bool, str]:
+    """Return (is_valid, error_message)."""
+    try:
+        ast.parse(code)
+        return True, ""
+    except SyntaxError as e:
+        return False, f"Line {e.lineno}: {e.msg}"
+
+
+def _count_tools_in_code(code: str) -> int:
+    """Count @tool decorated functions in the code."""
+    return len(re.findall(r"@tool\(", code))
+
+
+def _fix_code_with_llm(code: str, error: str, expected_tool_count: int) -> str:
+    """Ask the LLM to fix broken generated code."""
+    prompt = textwrap.dedent(f"""\
+        The following Python code has errors. Fix them and return the corrected
+        COMPLETE file inside a ```python fence.
+
+        Error: {error}
+        Expected number of @tool functions: {expected_tool_count}
+
+        ```python
+        {code}
+        ```
+    """)
+    raw = _call_llm(prompt, system_instruction=_SYSTEM_PROMPT, max_tokens=16384)
+    return _extract_code(raw)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Output model
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class GeneratedOutput:
+    """Result of code generation."""
+    server_code: str
+    test_code: str
+    requirements: str
+    env_template: str
+    server_name: str
+    tool_count: int
+    output_dir: Path | None = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main generator — purely LLM-driven
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def generate(
+    spec: APISpec,
+    tools: list[ToolDefinition],
+    server_name: str | None = None,
+    output_dir: str | Path | None = None,
+) -> GeneratedOutput:
+    """Generate a complete MCP server — entirely by the LLM.
+
+    No scaffolding, no stitching. The LLM generates the full server.py
+    in one shot, then we validate with ast.parse() and auto-repair if needed.
+    """
+    logger = get_logger()
+
+    with log_stage("Agentic Code Generation"):
+        name = server_name or re.sub(r"[^a-z0-9]+", "-", spec.title.lower()).strip("-")
+        env_prefix = re.sub(r"[^A-Z0-9]+", "_", spec.title.upper()).strip("_")
+
+        logger.info("Server: %s | Prefix: %s | Tools: %d", name, env_prefix, len(tools))
+        logger.info("Provider: Featherless (DeepSeek-V3-0324)")
+
+        # ── Step 1: Generate server.py (with retry loop) ────────────────
+        logger.info("Step 1: Generating complete server.py via LLM...")
+        prompt = _build_server_prompt(spec, tools, name, env_prefix)
+        expected = len(tools)
+        max_attempts = 3
+        server_code = ""
+        issue_str = ""
+
+        for attempt in range(1, max_attempts + 1):
+            if attempt == 1:
+                raw = _call_llm(prompt, system_instruction=_SYSTEM_PROMPT, max_tokens=16384)
+                server_code = _extract_code(raw)
+            else:
+                logger.info("  Retry %d/%d — asking LLM to fix...", attempt, max_attempts)
+                server_code = _fix_code_with_llm(server_code, issue_str, expected)
+
+            valid, err = _validate_python(server_code)
+            tool_count_in_code = _count_tools_in_code(server_code)
+
+            issues: list[str] = []
+            if not valid:
+                issues.append(f"Syntax error: {err}")
+            if tool_count_in_code < expected:
+                issues.append(
+                    f"Expected {expected} @tool functions, found {tool_count_in_code}"
+                )
+
+            if not issues:
+                logger.info("  ✓ Valid Python with %d/%d tools (attempt %d)", tool_count_in_code, expected, attempt)
+                break
+
+            issue_str = "; ".join(issues)
+            logger.warning("  Attempt %d validation failed: %s", attempt, issue_str)
+
+            if attempt == max_attempts:
+                logger.error("  All %d attempts exhausted. Best: %d/%d tools", max_attempts, tool_count_in_code, expected)
+
+        # ── Step 2: Generate test file (with retry) ──────────────────────
+        logger.info("Step 2: Generating test_server.py via LLM...")
+        test_prompt = _build_test_prompt(spec, tools)
+        raw_test = _call_llm(test_prompt, system_instruction=_SYSTEM_PROMPT, max_tokens=8192)
+        test_code = _extract_code(raw_test)
+
+        # Validate test has enough test functions
+        test_func_count = len(re.findall(r"(?:async )?def test_", test_code))
+        # We expect at minimum: test_list_tools + test_tool_schemas + 1 per tool
+        min_tests = 2 + expected
+        if test_func_count < min_tests:
+            logger.warning("  Test file has %d tests, expected >= %d — regenerating...", test_func_count, min_tests)
+            enhanced_test_prompt = _build_test_prompt(spec, tools) + (
+                f"\n\nIMPORTANT: You MUST generate at least {min_tests} test functions:\n"
+                f"- test_list_tools()\n- test_tool_schemas()\n"
+                + "\n".join(f"- test_{t.name}()" for t in tools)
+                + "\nGenerate ALL of them. Do NOT skip any."
+            )
+            raw_test2 = _call_llm(enhanced_test_prompt, system_instruction=_SYSTEM_PROMPT, max_tokens=16384)
+            test_code2 = _extract_code(raw_test2)
+            new_count = len(re.findall(r"(?:async )?def test_", test_code2))
+            if new_count > test_func_count:
+                test_code = test_code2
+                logger.info("  Retry improved: %d → %d test functions", test_func_count, new_count)
+            else:
+                logger.info("  Retry did not improve (%d tests), keeping original", new_count)
+
+        # ── Step 4: Write config files ───────────────────────────────────
+        logger.info("Step 4: Writing config files...")
+
+        requirements = "dedalus-mcp>=0.7.0\nhttpx>=0.28\n"
+        env_template = (
+            f"# {spec.title} MCP Server Configuration\n"
+            f"{env_prefix}_BASE_URL={spec.base_url}\n"
+            f"{env_prefix}_API_KEY=your-api-key-here\n"
+        )
+        main_code = (
+            '"""Entry point for Dedalus deployment."""\n\n'
+            "from server import server\n"
+            "import asyncio\n\n"
+            'if __name__ == "__main__":\n'
+            "    asyncio.run(server.serve())\n"
+        )
+        pyproject = (
+            "[project]\n"
+            f'name = "{name}"\n'
+            'version = "0.1.0"\n'
+            f'description = "Auto-generated MCP adapter for {spec.title}"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "dedalus-mcp>=0.7.0",\n'
+            '    "httpx>=0.27.0",\n'
+            "]\n\n"
+            "[build-system]\n"
+            'requires = ["setuptools"]\n'
+            'build-backend = "setuptools.backends._legacy:_Backend"\n'
+        )
+
+        # Deployment manifest — everything Dedalus needs in one file
+        # Build env vars: always include BASE_URL, then add auth-specific vars
+        env_vars: dict[str, dict] = {
+            f"{env_prefix}_BASE_URL": {
+                "value": spec.base_url,
+                "required": True,
+                "description": f"Base URL for {spec.title}",
+            },
+        }
+
+        # Detect auth credentials from spec
+        auth_info: list[dict] = []
+        if spec.auth_schemes:
+            for scheme in spec.auth_schemes:
+                if scheme.scheme_type == "apiKey":
+                    header = scheme.header_name or scheme.name or "X-API-Key"
+                    env_key = f"{env_prefix}_API_KEY"
+                    env_vars[env_key] = {
+                        "value": "",
+                        "required": True,
+                        "description": f"API key — sent as `{header}` header",
+                    }
+                    auth_info.append({
+                        "type": "apiKey",
+                        "header": header,
+                        "location": scheme.location or "header",
+                        "env_var": env_key,
+                    })
+                elif scheme.scheme_type in ("http", "oauth2"):
+                    env_key = f"{env_prefix}_API_KEY"
+                    env_vars[env_key] = {
+                        "value": "",
+                        "required": True,
+                        "description": "Bearer token — sent as `Authorization: Bearer <token>`",
+                    }
+                    auth_info.append({
+                        "type": scheme.scheme_type,
+                        "header": "Authorization",
+                        "scheme": "Bearer",
+                        "env_var": env_key,
+                    })
+                    if scheme.scheme_type == "oauth2" and scheme.flows:
+                        # Add OAuth-specific env vars
+                        env_vars[f"{env_prefix}_CLIENT_ID"] = {
+                            "value": "",
+                            "required": True,
+                            "description": "OAuth2 client ID",
+                        }
+                        env_vars[f"{env_prefix}_CLIENT_SECRET"] = {
+                            "value": "",
+                            "required": True,
+                            "description": "OAuth2 client secret",
+                        }
+                        auth_info[-1]["oauth_env_vars"] = [
+                            f"{env_prefix}_CLIENT_ID",
+                            f"{env_prefix}_CLIENT_SECRET",
+                        ]
+                else:
+                    env_key = f"{env_prefix}_API_KEY"
+                    env_vars[env_key] = {
+                        "value": "",
+                        "required": True,
+                        "description": f"Credential for {scheme.scheme_type} auth ({scheme.name})",
+                    }
+                    auth_info.append({
+                        "type": scheme.scheme_type,
+                        "name": scheme.name,
+                        "env_var": env_key,
+                    })
+        else:
+            # No auth declared — still include optional API_KEY
+            env_vars[f"{env_prefix}_API_KEY"] = {
+                "value": "",
+                "required": False,
+                "description": "Optional API key (no auth required by spec)",
+            }
+
+        dedalus_manifest = {
+            "server_name": name,
+            "api_title": spec.title,
+            "api_version": spec.version,
+            "base_url": spec.base_url,
+            "env_prefix": env_prefix,
+            "tool_count": len(tools),
+            "auth_required": len(spec.auth_schemes) > 0,
+            "auth_schemes": auth_info,
+            "env_vars": env_vars,
+            "tools": [
+                {
+                    "name": t.name,
+                    "safety": t.safety.value,
+                    "method": t.endpoints[0].method.value if t.endpoints else "GET",
+                    "path": t.endpoints[0].path if t.endpoints else "",
+                }
+                for t in tools
+            ],
+        }
+
+        output = GeneratedOutput(
+            server_code=server_code, test_code=test_code,
+            requirements=requirements, env_template=env_template,
+            server_name=name, tool_count=len(tools),
+        )
+
+        if output_dir:
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "server.py").write_text(server_code, encoding="utf-8")
+            (out / "test_server.py").write_text(test_code, encoding="utf-8")
+            (out / "requirements.txt").write_text(requirements, encoding="utf-8")
+            (out / ".env.example").write_text(env_template, encoding="utf-8")
+            (out / "main.py").write_text(main_code, encoding="utf-8")
+            (out / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            (out / "dedalus.json").write_text(
+                json.dumps(dedalus_manifest, indent=2) + "\n", encoding="utf-8"
+            )
+            output.output_dir = out
+            logger.info("Wrote 7 files to %s", out)
+
+    return output
