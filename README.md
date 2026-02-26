@@ -138,10 +138,9 @@ output/my-api-mcp/
 ├── server.py          # Async MCP server with @tool decorators
 ├── test_server.py     # Contract tests for every tool
 ├── main.py            # Deployment entry point
-├── requirements.txt   # dedalus-mcp, httpx
+├── requirements.txt   # httpx, dedalus-mcp
 ├── pyproject.toml     # Package metadata
-├── .env.example       # Upstream API credentials template
-└── dedalus.json       # Deployment manifest
+└── .env.example       # Upstream API credentials template
 ```
 
 Example generated tool:
@@ -213,7 +212,6 @@ docker run -p 8080:8080 --env-file .env anvil
 - **Claude Haiku** (Anthropic) — LLM code generation
 - **Google Gemini 2.5 Flash** — doc parsing, SDK introspection, tool classification
 - **Python 3.11+** — FastAPI, Click, Pydantic, httpx
-- **Dedalus MCP** — runtime framework for generated servers
 - **Next.js 16** + React 19 + Tailwind CSS v4 — web dashboard
 
 ---
