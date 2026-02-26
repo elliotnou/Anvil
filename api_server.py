@@ -67,7 +67,7 @@ def _get_credits(user: str) -> dict:
     p = _CREDITS_DIR / f"{user}.json"
     if p.exists():
         return json.loads(p.read_text())
-    return {"user": user, "balance": 0, "total_purchased": 0, "total_spent": 0, "transactions": []}
+    return {"user": user, "balance": 100, "total_purchased": 100, "total_spent": 0, "transactions": [{"amount": 100, "type": "welcome", "reason": "Welcome bonus"}]}
 
 
 def _save_credits(user: str, data: dict) -> None:
