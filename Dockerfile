@@ -18,4 +18,4 @@ RUN mkdir -p .sessions .credits output
 
 EXPOSE 8080
 
-CMD ["uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["sh", "-c", "uvicorn api_server:app --host 0.0.0.0 --port ${PORT:-8080}"]
