@@ -74,7 +74,7 @@ export default function GeneratePage() {
       <StepHeader
         currentStep="generate"
         title="Generate MCP Server"
-        description="AI-powered code generation using DeepSeek-V3 via Featherless"
+        description="AI-powered code generation using Claude Haiku"
       />
 
       {!generated ? (
@@ -124,7 +124,7 @@ export default function GeneratePage() {
             ) : (
               <Button onClick={handleGenerate} disabled={loading} className="btn-gradient rounded-full px-8 h-12 relative z-10">
                 {loading ? (
-                  <><Loader2 className="w-4 h-4 animate-spin" /> Generating with DeepSeek-V3...</>
+                  <><Loader2 className="w-4 h-4 animate-spin" /> Generating with Claude Haiku...</>
                 ) : (
                   <><FileCode2 className="w-4 h-4" /> Generate Server Code ({cost} credits)</>
                 )}
